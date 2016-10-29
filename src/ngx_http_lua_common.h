@@ -101,6 +101,9 @@ typedef struct {
 #define NGX_HTTP_LUA_MAX_HEADERS 100
 #endif
 
+#ifndef NGX_HTTP_LUA_BUILTIN_HEADER_LEN_MAX
+#define NGX_HTTP_LUA_BUILTIN_HEADER_LEN_MAX 64
+#endif
 
 /* must be within 16 bit */
 #define NGX_HTTP_LUA_CONTEXT_SET            0x0001
@@ -194,6 +197,8 @@ struct ngx_http_lua_main_conf_s {
     ngx_uint_t                      shm_zones_inited;
 
     ngx_http_lua_sema_mm_t         *sema_mm;
+    ngx_hash_t                      headers_in_hash;
+    ngx_uint_t                      headers_in_len_max;
 
     ngx_uint_t           malloc_trim_cycle;  /* a cycle is defined as the number
                                                 of reqeusts */
