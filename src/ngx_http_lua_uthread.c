@@ -89,7 +89,7 @@ ngx_http_lua_uthread_spawn(lua_State *L)
 
     ctx->cur_co_ctx->thread_spawn_yielded = 1;
 
-    if (ngx_http_lua_post_thread(r, ctx, ctx->cur_co_ctx) != NGX_OK) {
+    if (ngx_http_lua_post_thread(r, ctx, ctx->cur_co_ctx, 0) != NGX_OK) {
         return luaL_error(L, "no memory");
     }
 
@@ -207,9 +207,11 @@ static int
 ngx_http_lua_uthread_kill(lua_State *L)
 {
     lua_State                   *sub_co;
+    lua_State                   *parent_co;
     ngx_http_request_t          *r;
     ngx_http_lua_ctx_t          *ctx;
-    ngx_http_lua_co_ctx_t       *coctx, *sub_coctx;
+    ngx_http_lua_co_ctx_t       *sub_coctx;
+    ngx_http_lua_co_ctx_t       *parent_coctx;
 
     r = ngx_http_lua_get_req(L);
     if (r == NULL) {
@@ -227,8 +229,6 @@ ngx_http_lua_uthread_kill(lua_State *L)
                                | NGX_HTTP_LUA_CONTEXT_TIMER
                                | NGX_HTTP_LUA_CONTEXT_SSL_CERT);
 
-    coctx = ctx->cur_co_ctx;
-
     sub_co = lua_tothread(L, 1);
     luaL_argcheck(L, sub_co, 1, "lua thread expected");
 
@@ -244,9 +244,9 @@ ngx_http_lua_uthread_kill(lua_State *L)
         return 2;
     }
 
-    if (sub_coctx->parent_co_ctx != coctx) {
+    if (ctx->cur_co_ctx == sub_coctx) {
         lua_pushnil(L);
-        lua_pushliteral(L, "killer not parent");
+        lua_pushliteral(L, "not allowed to kill self");
         return 2;
     }
 
@@ -274,6 +274,15 @@ ngx_http_lua_uthread_kill(lua_State *L)
         ngx_http_lua_cleanup_pending_operation(sub_coctx);
         ngx_http_lua_del_thread(r, L, ctx, sub_coctx);
         ctx->uthreads--;
+
+        /* notify the parent that the thread was killed */
+        parent_coctx = sub_coctx->parent_co_ctx;
+        if (sub_coctx->waited_by_parent && parent_coctx) {
+            parent_co = parent_coctx->co;
+            lua_pushboolean(parent_co, 0);
+            lua_pushstring(parent_co, "user thread killed");
+            ngx_http_lua_post_thread(r, ctx, parent_coctx, 2);
+        }
 
         lua_pushinteger(L, 1);
         return 1;
