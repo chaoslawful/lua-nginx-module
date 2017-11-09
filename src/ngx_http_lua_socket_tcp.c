@@ -92,6 +92,8 @@ static int ngx_http_lua_socket_cleanup_compiled_pattern(lua_State *L);
 static int ngx_http_lua_req_socket(lua_State *L);
 static void ngx_http_lua_req_socket_rev_handler(ngx_http_request_t *r);
 static int ngx_http_lua_socket_tcp_getreusedtimes(lua_State *L);
+static int ngx_http_lua_socket_tcp_settagdata(lua_State *L);
+static int ngx_http_lua_socket_tcp_gettagdata(lua_State *L);
 static int ngx_http_lua_socket_tcp_setkeepalive(lua_State *L);
 static ngx_int_t ngx_http_lua_get_keepalive_peer(ngx_http_request_t *r,
     lua_State *L, int key_index,
@@ -132,6 +134,18 @@ static void ngx_http_lua_ssl_handshake_handler(ngx_connection_t *c);
 static int ngx_http_lua_ssl_free_session(lua_State *L);
 #endif
 static void ngx_http_lua_socket_tcp_close_connection(ngx_connection_t *c);
+static void ngx_http_lua_socket_tag_rbtree_insert_value(
+    ngx_rbtree_node_t *temp, ngx_rbtree_node_t *node,
+    ngx_rbtree_node_t *sentinel);
+static int ngx_http_lua_socket_tag_set_helper(lua_State *L, int flags);
+static int ngx_http_lua_socket_tag_get_helper(lua_State *L);
+static int ngx_http_lua_socket_tag_init(
+    ngx_http_lua_socket_tag_ctx_t **pp_tag_ctx);
+static void ngx_http_lua_socket_tag_destroy(
+    ngx_http_lua_socket_tag_ctx_t **pp_tag_ctx);
+static ngx_int_t ngx_http_lua_shdict_lookup(
+    ngx_http_lua_socket_tag_ctx_t *tag_ctx, ngx_uint_t hash,
+    u_char *kdata, size_t klen, ngx_http_lua_socket_tag_node_t **stp);
 
 
 enum {
@@ -226,7 +240,7 @@ ngx_http_lua_inject_socket_tcp_api(ngx_log_t *log, lua_State *L)
 
     /* {{{req socket object metatable */
     lua_pushlightuserdata(L, &ngx_http_lua_req_socket_metatable_key);
-    lua_createtable(L, 0 /* narr */, 5 /* nrec */);
+    lua_createtable(L, 0 /* narr */, 7 /* nrec */);
 
     lua_pushcfunction(L, ngx_http_lua_socket_tcp_receive);
     lua_setfield(L, -2, "receive");
@@ -236,6 +250,13 @@ ngx_http_lua_inject_socket_tcp_api(ngx_log_t *log, lua_State *L)
 
     lua_pushcfunction(L, ngx_http_lua_socket_tcp_settimeout);
     lua_setfield(L, -2, "settimeout"); /* ngx socket mt */
+
+
+    lua_pushcfunction(L, ngx_http_lua_socket_tcp_settagdata);
+    lua_setfield(L, -2, "settag");
+
+    lua_pushcfunction(L, ngx_http_lua_socket_tcp_gettagdata);
+    lua_setfield(L, -2, "gettag");
 
     lua_pushcfunction(L, ngx_http_lua_socket_tcp_settimeouts);
     lua_setfield(L, -2, "settimeouts"); /* ngx socket mt */
@@ -248,7 +269,7 @@ ngx_http_lua_inject_socket_tcp_api(ngx_log_t *log, lua_State *L)
 
     /* {{{raw req socket object metatable */
     lua_pushlightuserdata(L, &ngx_http_lua_raw_req_socket_metatable_key);
-    lua_createtable(L, 0 /* narr */, 6 /* nrec */);
+    lua_createtable(L, 0 /* narr */, 8 /* nrec */);
 
     lua_pushcfunction(L, ngx_http_lua_socket_tcp_receive);
     lua_setfield(L, -2, "receive");
@@ -262,6 +283,12 @@ ngx_http_lua_inject_socket_tcp_api(ngx_log_t *log, lua_State *L)
     lua_pushcfunction(L, ngx_http_lua_socket_tcp_settimeout);
     lua_setfield(L, -2, "settimeout"); /* ngx socket mt */
 
+    lua_pushcfunction(L, ngx_http_lua_socket_tcp_settagdata);
+    lua_setfield(L, -2, "settag");
+
+    lua_pushcfunction(L, ngx_http_lua_socket_tcp_gettagdata);
+    lua_setfield(L, -2, "gettag");
+
     lua_pushcfunction(L, ngx_http_lua_socket_tcp_settimeouts);
     lua_setfield(L, -2, "settimeouts"); /* ngx socket mt */
 
@@ -273,7 +300,7 @@ ngx_http_lua_inject_socket_tcp_api(ngx_log_t *log, lua_State *L)
 
     /* {{{tcp object metatable */
     lua_pushlightuserdata(L, &ngx_http_lua_tcp_socket_metatable_key);
-    lua_createtable(L, 0 /* narr */, 12 /* nrec */);
+    lua_createtable(L, 0 /* narr */, 14 /* nrec */);
 
     lua_pushcfunction(L, ngx_http_lua_socket_tcp_connect);
     lua_setfield(L, -2, "connect");
@@ -311,6 +338,12 @@ ngx_http_lua_inject_socket_tcp_api(ngx_log_t *log, lua_State *L)
 
     lua_pushcfunction(L, ngx_http_lua_socket_tcp_setkeepalive);
     lua_setfield(L, -2, "setkeepalive");
+
+    lua_pushcfunction(L, ngx_http_lua_socket_tcp_settagdata);
+    lua_setfield(L, -2, "settag");
+
+    lua_pushcfunction(L, ngx_http_lua_socket_tcp_gettagdata);
+    lua_setfield(L, -2, "gettag");
 
     lua_pushvalue(L, -1);
     lua_setfield(L, -2, "__index");
@@ -610,6 +643,9 @@ ngx_http_lua_socket_tcp_connect(lua_State *L)
         u->connect_timeout = u->conf->connect_timeout;
     }
 
+
+    u->tag_ctx = NULL;
+
     if (send_timeout > 0) {
         u->send_timeout = (ngx_msec_t) send_timeout;
 
@@ -638,6 +674,13 @@ ngx_http_lua_socket_tcp_connect(lua_State *L)
     }
 
     /* rc == NGX_DECLINED */
+    if (u->tag_ctx == NULL) {
+        rc = ngx_http_lua_socket_tag_init(&u->tag_ctx);
+
+        if (rc != NGX_OK) {
+            return luaL_error(L, "no memory");
+        }
+    }
 
     /* TODO: we should avoid this in-pool allocation */
 
@@ -3465,6 +3508,8 @@ ngx_http_lua_socket_tcp_finalize(ngx_http_request_t *r,
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "lua finalize socket");
 
+    ngx_http_lua_socket_tag_destroy(&u->tag_ctx);
+
     if (u->cleanup) {
         *u->cleanup = NULL;
         ngx_http_lua_cleanup_free(r, u->cleanup);
@@ -4183,6 +4228,7 @@ static int
 ngx_http_lua_req_socket(lua_State *L)
 {
     int                              n, raw;
+    ngx_int_t                        rc;
     ngx_peer_connection_t           *pc;
     ngx_http_lua_loc_conf_t         *llcf;
     ngx_connection_t                *c;
@@ -4387,6 +4433,14 @@ ngx_http_lua_req_socket(lua_State *L)
     u->connect_timeout = u->conf->connect_timeout;
     u->send_timeout = u->conf->send_timeout;
 
+    if (u->tag_ctx == NULL) {
+        rc = ngx_http_lua_socket_tag_init(&u->tag_ctx);
+
+        if (rc != NGX_OK) {
+            return luaL_error(L, "no memory");
+        }
+    }
+
     cln = ngx_http_lua_cleanup_add(r, 0);
     if (cln == NULL) {
         u->ft_type |= NGX_HTTP_LUA_SOCKET_FT_ERROR;
@@ -4475,6 +4529,321 @@ ngx_http_lua_socket_tcp_getreusedtimes(lua_State *L)
     }
 
     lua_pushinteger(L, u->reused);
+    return 1;
+}
+
+
+static int
+ngx_http_lua_socket_tcp_gettagdata(lua_State *L)
+{
+    return ngx_http_lua_socket_tag_get_helper(L);
+}
+
+
+static int
+ngx_http_lua_socket_tcp_settagdata(lua_State *L)
+{
+    return ngx_http_lua_socket_tag_set_helper(L, 0);
+}
+
+
+static int
+ngx_http_lua_socket_tag_init(ngx_http_lua_socket_tag_ctx_t **pp_tag_ctx)
+{
+    ngx_http_lua_socket_tag_ctx_t   *tag_ctx;
+
+    tag_ctx = *pp_tag_ctx;
+
+    if (tag_ctx == NULL) {
+
+        tag_ctx = ngx_alloc(sizeof(ngx_http_lua_socket_tag_ctx_t),
+                            ngx_cycle->log);
+
+        if (tag_ctx == NULL) {
+            return NGX_ERROR;
+        }
+
+        ngx_rbtree_init(&(tag_ctx->rbtree), &(tag_ctx->sentinel),
+                        ngx_http_lua_socket_tag_rbtree_insert_value);
+
+        *pp_tag_ctx = tag_ctx;
+
+    }
+
+    return NGX_OK;
+}
+
+
+static void
+ngx_http_lua_socket_tag_destroy(ngx_http_lua_socket_tag_ctx_t **pp_tag_ctx)
+{
+    ngx_rbtree_node_t               *node, *sentinel;
+    ngx_http_lua_socket_tag_ctx_t   *tag_ctx;
+
+    tag_ctx = *pp_tag_ctx;
+
+    if (tag_ctx == NULL) {
+        return ;
+    }
+
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, ngx_cycle->log, 0,
+                   "lua tcp socket tag data free: %p", tag_ctx);
+
+    for (;;) {
+        node = tag_ctx->rbtree.root;
+        sentinel = tag_ctx->rbtree.sentinel;
+
+        if (node == sentinel) {
+            break;
+        }
+
+        ngx_rbtree_delete(&tag_ctx->rbtree, node);
+        ngx_free(node);
+    }
+
+    ngx_free(tag_ctx);
+
+    *pp_tag_ctx = NULL;
+    return ;
+}
+
+
+static int
+ngx_http_lua_socket_tag_get_helper(lua_State *L)
+{
+    ngx_str_t                              key;
+    uint32_t                               hash;
+    ngx_int_t                              rc;
+    ngx_http_lua_socket_tag_node_t        *st;
+    ngx_http_lua_socket_tcp_upstream_t    *u;
+    ngx_http_lua_socket_tag_ctx_t         *tag_ctx;
+    ngx_str_t                              value;
+    int                                    value_type;
+    double                                 num;
+    u_char                                 c;
+
+    if (lua_gettop(L) != 2) {
+        return luaL_error(L, "expecting 2 argument "
+                          "(including the object), but got %d", lua_gettop(L));
+    }
+
+    luaL_checktype(L, 1, LUA_TTABLE);
+    luaL_checktype(L, 2, LUA_TSTRING);
+
+    lua_rawgeti(L, 1, SOCKET_CTX_INDEX);
+    u = lua_touserdata(L, -1);
+
+    key.data = (u_char *) luaL_checklstring(L, 2, &key.len);
+
+    if (key.len == 0) {
+        lua_pushnil(L);
+        lua_pushliteral(L, "empty key");
+        return 2;
+    }
+
+    if (key.len > 65535) {
+        lua_pushnil(L);
+        lua_pushliteral(L, "key too long");
+        return 2;
+    }
+
+    hash = ngx_crc32_short(key.data, key.len);
+
+    /* lookup */
+
+    tag_ctx = u->tag_ctx;
+
+    if (tag_ctx == NULL) {
+        return luaL_error(L, "the tag_ctx value is NULL, it's not expected");
+    }
+
+    st = NULL;
+    rc = ngx_http_lua_shdict_lookup(tag_ctx, hash, (u_char *)key.data,
+                               key.len, &st);
+
+    if (rc == NGX_DECLINED) {
+        lua_pushnil(L);
+        return 1;
+    }
+
+    value_type = st->value_type;
+
+    dd("data: %p", st->data);
+    dd("key len: %d", (int) st->key_len);
+
+    value.data = st->data + st->key_len;
+    value.len = (size_t) st->value_len;
+
+    switch (value_type) {
+
+    case LUA_TSTRING:
+
+        lua_pushlstring(L, (char *) value.data, value.len);
+        break;
+
+    case LUA_TNUMBER:
+
+        if (value.len != sizeof(double)) {
+
+            return luaL_error(L, "bad lua number value size found for key %s "
+                              "in %lu", key.data, (unsigned long) value.len);
+        }
+
+        ngx_memcpy(&num, value.data, sizeof(double));
+
+        lua_pushnumber(L, num);
+        break;
+
+    case LUA_TBOOLEAN:
+
+        if (value.len != sizeof(u_char)) {
+
+            return luaL_error(L, "bad lua boolean value size found for key %s "
+                              "in %lu", key.data, (unsigned long) value.len);
+        }
+
+        c = *value.data;
+
+        lua_pushboolean(L, c ? 1 : 0);
+        break;
+
+    default:
+
+        return luaL_error(L, "bad value type found for key %s in "
+                          "%d", key.data, value_type);
+    }
+
+    return 1;
+}
+
+
+static int
+ngx_http_lua_socket_tag_set_helper(lua_State *L, int flags)
+{
+    int                                    n;
+    ngx_str_t                              key;
+    u_char                                *p;
+    ngx_rbtree_node_t                     *node;
+    uint32_t                               hash;
+    ngx_int_t                              rc;
+    ngx_http_lua_socket_tag_node_t        *st;
+    ngx_str_t                              value;
+    int                                    value_type;
+    double                                 num;
+    u_char                                 c;
+    ngx_http_lua_socket_tcp_upstream_t    *u;
+    ngx_http_lua_socket_tag_ctx_t         *tag_ctx;
+
+    if (lua_gettop(L) != 3) {
+        return luaL_error(L, "expecting 3 argument "
+                          "(including the object), but got %d", lua_gettop(L));
+    }
+
+    luaL_checktype(L, 1, LUA_TTABLE);
+    luaL_checktype(L, 2, LUA_TSTRING);
+
+    lua_rawgeti(L, 1, SOCKET_CTX_INDEX);
+    u = lua_touserdata(L, -1);
+
+
+    key.data = (u_char *) luaL_checklstring(L, 2, &key.len);
+
+    if (key.len == 0) {
+        lua_pushnil(L);
+        lua_pushliteral(L, "empty key");
+        return 2;
+    }
+
+    if (key.len > 65535) {
+        lua_pushnil(L);
+        lua_pushliteral(L, "key too long");
+        return 2;
+    }
+
+    hash = ngx_crc32_short(key.data, key.len);
+
+    value_type = lua_type(L, 3);
+
+    switch (value_type) {
+
+    case LUA_TSTRING:
+        value.data = (u_char *) lua_tolstring(L, 3, &value.len);
+        break;
+
+    case LUA_TNUMBER:
+        value.len = sizeof(double);
+        num = lua_tonumber(L, 3);
+        value.data = (u_char *) &num;
+        break;
+
+    case LUA_TBOOLEAN:
+        value.len = sizeof(u_char);
+        c = lua_toboolean(L, 3) ? 1 : 0;
+        value.data = &c;
+        break;
+
+    case LUA_TNIL:
+        ngx_str_null(&value);
+        break;
+
+    default:
+        lua_pushnil(L);
+        lua_pushliteral(L, "bad value type");
+        return 2;
+    }
+
+    /* lookup */
+    tag_ctx = u->tag_ctx;
+
+    if (tag_ctx == NULL) {
+        return luaL_error(L, "the tag_ctx value is NULL, it's not expected");
+    }
+
+    st = NULL;
+    rc = ngx_http_lua_shdict_lookup(tag_ctx, hash, (u_char *)key.data,
+                               key.len, &st);
+    if (rc == NGX_OK) {
+        goto remove;
+    }
+
+    goto insert;
+
+remove:
+    node = (ngx_rbtree_node_t *)
+                   ((u_char *) st - offsetof(ngx_rbtree_node_t, color));
+
+    ngx_rbtree_delete(&tag_ctx->rbtree, node);
+    ngx_free(node);
+    node = NULL;
+
+insert:
+    if (value.data == NULL) {
+        lua_pushboolean(L, 1);
+        return 1;
+    }
+
+    n = offsetof(ngx_rbtree_node_t, color)
+        + offsetof(ngx_http_lua_socket_tag_node_t, data)
+        + key.len
+        + value.len;
+
+    node = ngx_alloc(n, ngx_cycle->log);
+    if (node == NULL) {
+        lua_pushnil(L);
+        lua_pushliteral(L, "no memory");
+        return 2;
+    }
+
+    node->key = hash;
+    st = (ngx_http_lua_socket_tag_node_t *) &node->color;
+    st->key_len = (u_short) key.len;
+    st->value_len = (uint32_t) value.len;
+    st->value_type = (uint8_t) value_type;
+    p = ngx_copy(st->data, key.data, key.len);
+    ngx_memcpy(p, value.data, value.len);
+    ngx_rbtree_insert(&tag_ctx->rbtree, node);
+
+    lua_pushboolean(L, 1);
     return 1;
 }
 
@@ -4737,6 +5106,8 @@ ngx_http_lua_socket_tcp_setkeepalive(lua_State *L)
     item->socklen = pc->socklen;
     ngx_memcpy(&item->sockaddr, pc->sockaddr, pc->socklen);
     item->reused = u->reused;
+    item->tag_ctx = u->tag_ctx;
+    u->tag_ctx = NULL;
 
     if (c->read->ready) {
         rc = ngx_http_lua_socket_keepalive_close_handler(c->read);
@@ -4827,6 +5198,8 @@ ngx_http_lua_get_keepalive_peer(ngx_http_request_t *r, lua_State *L,
         pc->cached = 1;
 
         u->reused = item->reused + 1;
+        u->tag_ctx = item->tag_ctx;
+        item->tag_ctx = NULL;
 
 #if 1
         u->write_event_handler = ngx_http_lua_socket_dummy_handler;
@@ -4923,6 +5296,8 @@ close:
     item = c->data;
     spool = item->socket_pool;
 
+    ngx_http_lua_socket_tag_destroy(&item->tag_ctx);
+
     ngx_http_lua_socket_tcp_close_connection(c);
 
     ngx_queue_remove(&item->queue);
@@ -4979,6 +5354,8 @@ ngx_http_lua_socket_shutdown_pool(lua_State *L)
         item = ngx_queue_data(q, ngx_http_lua_socket_pool_item_t, queue);
         c = item->connection;
 
+        ngx_http_lua_socket_tag_destroy(&item->tag_ctx);
+
         ngx_http_lua_socket_tcp_close_connection(c);
 
         ngx_queue_remove(q);
@@ -5023,6 +5400,8 @@ ngx_http_lua_socket_downstream_destroy(lua_State *L)
         dd("u is NULL");
         return 0;
     }
+
+    ngx_http_lua_socket_tag_destroy(&u->tag_ctx);
 
     if (u->cleanup) {
         ngx_http_lua_socket_tcp_cleanup(u); /* it will clear u->cleanup */
@@ -5420,6 +5799,8 @@ ngx_http_lua_cleanup_conn_pools(lua_State *L)
             item = ngx_queue_data(q, ngx_http_lua_socket_pool_item_t, queue);
             c = item->connection;
 
+            ngx_http_lua_socket_tag_destroy(&item->tag_ctx);
+
             ngx_http_lua_socket_tcp_close_connection(c);
 
             ngx_queue_remove(q);
@@ -5434,5 +5815,88 @@ ngx_http_lua_cleanup_conn_pools(lua_State *L)
 
     lua_pop(L, 1);
 }
+
+
+static void
+ngx_http_lua_socket_tag_rbtree_insert_value(ngx_rbtree_node_t *temp,
+    ngx_rbtree_node_t *node, ngx_rbtree_node_t *sentinel)
+{
+    ngx_rbtree_node_t               **p;
+    ngx_http_lua_socket_tag_node_t   *sdn, *sdnt;
+
+    for ( ;; ) {
+
+        if (node->key < temp->key) {
+
+            p = &temp->left;
+
+        } else if (node->key > temp->key) {
+
+            p = &temp->right;
+
+        } else { /* node->key == temp->key */
+
+            sdn = (ngx_http_lua_socket_tag_node_t *) &node->color;
+            sdnt = (ngx_http_lua_socket_tag_node_t *) &temp->color;
+
+            p = ngx_memn2cmp(sdn->data, sdnt->data, sdn->key_len,
+                             sdnt->key_len) < 0 ? &temp->left : &temp->right;
+        }
+
+        if (*p == sentinel) {
+            break;
+        }
+
+        temp = *p;
+    }
+
+    *p = node;
+    node->parent = temp;
+    node->left = sentinel;
+    node->right = sentinel;
+    ngx_rbt_red(node);
+}
+
+
+static ngx_int_t ngx_http_lua_shdict_lookup(
+    ngx_http_lua_socket_tag_ctx_t *tag_ctx, ngx_uint_t hash,
+    u_char *kdata, size_t klen, ngx_http_lua_socket_tag_node_t **stp)
+{
+    ngx_rbtree_node_t                     *node, *sentinel;
+    ngx_http_lua_socket_tag_node_t        *st;
+    ngx_int_t                              rc;
+
+    node = tag_ctx->rbtree.root;
+    sentinel = tag_ctx->rbtree.sentinel;
+
+    while (node != sentinel) {
+        if (hash < node->key) {
+            node = node->left;
+            continue;
+        }
+
+        if (hash > node->key) {
+            node = node->right;
+            continue;
+        }
+
+        /* hash == node->key */
+        st = (ngx_http_lua_socket_tag_node_t *) &node->color;
+        rc = ngx_memn2cmp((u_char *)kdata, st->data, klen,
+                          (size_t) st->key_len);
+
+        if (rc == 0) {
+            *stp = st;
+            return NGX_OK;
+        }
+
+        node = (rc < 0) ? node->left : node->right;
+    }
+
+    *stp = NULL;
+
+    return NGX_DECLINED;
+}
+
 
 /* vi:set ft=c ts=4 sw=4 et fdm=marker: */
