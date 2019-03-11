@@ -30,6 +30,8 @@ static int ngx_http_lua_shdict_add(lua_State *L);
 static int ngx_http_lua_shdict_safe_add(lua_State *L);
 static int ngx_http_lua_shdict_replace(lua_State *L);
 static int ngx_http_lua_shdict_incr(lua_State *L);
+static int ngx_http_lua_shdict_decr(lua_State *L);
+static int ngx_http_lua_shdict_incr_helper(lua_State *L, int flags);
 static int ngx_http_lua_shdict_delete(lua_State *L);
 static int ngx_http_lua_shdict_flush_all(lua_State *L);
 static int ngx_http_lua_shdict_flush_expired(lua_State *L);
@@ -54,6 +56,10 @@ static ngx_inline ngx_shm_zone_t *ngx_http_lua_shdict_get_zone(lua_State *L,
 
 #define NGX_HTTP_LUA_SHDICT_LEFT        0x0001
 #define NGX_HTTP_LUA_SHDICT_RIGHT       0x0002
+
+
+#define NGX_HTTP_LUA_SHDICT_INCR        0x0001
+#define NGX_HTTP_LUA_SHDICT_DECR        0x0002
 
 
 enum {
@@ -331,7 +337,7 @@ ngx_http_lua_inject_shdict_api(ngx_http_lua_main_conf_t *lmcf, lua_State *L)
         lua_createtable(L, 0, lmcf->shdict_zones->nelts /* nrec */);
                 /* ngx.shared */
 
-        lua_createtable(L, 0 /* narr */, 18 /* nrec */); /* shared mt */
+        lua_createtable(L, 0 /* narr */, 19 /* nrec */); /* shared mt */
 
         lua_pushcfunction(L, ngx_http_lua_shdict_get);
         lua_setfield(L, -2, "get");
@@ -356,6 +362,9 @@ ngx_http_lua_inject_shdict_api(ngx_http_lua_main_conf_t *lmcf, lua_State *L)
 
         lua_pushcfunction(L, ngx_http_lua_shdict_incr);
         lua_setfield(L, -2, "incr");
+
+        lua_pushcfunction(L, ngx_http_lua_shdict_decr);
+        lua_setfield(L, -2, "decr");
 
         lua_pushcfunction(L, ngx_http_lua_shdict_delete);
         lua_setfield(L, -2, "delete");
@@ -1258,6 +1267,20 @@ allocated:
 static int
 ngx_http_lua_shdict_incr(lua_State *L)
 {
+    return ngx_http_lua_shdict_incr_helper(L, NGX_HTTP_LUA_SHDICT_INCR);
+}
+
+
+static int
+ngx_http_lua_shdict_decr(lua_State *L)
+{
+    return ngx_http_lua_shdict_incr_helper(L, NGX_HTTP_LUA_SHDICT_DECR);
+}
+
+
+static int
+ngx_http_lua_shdict_incr_helper(lua_State *L, int flags)
+{
     int                          i, n;
     ngx_str_t                    key;
     uint32_t                     hash;
@@ -1316,6 +1339,12 @@ ngx_http_lua_shdict_incr(lua_State *L)
 
     value = luaL_checknumber(L, 3);
 
+    if (flags == NGX_HTTP_LUA_SHDICT_DECR && value <= 0) {
+        lua_pushnil(L);
+        lua_pushliteral(L, "must decr by a positive value");
+        return 2;
+    }
+
     if (n == 4) {
         init = luaL_checknumber(L, 4);
     }
@@ -1343,8 +1372,22 @@ ngx_http_lua_shdict_incr(lua_State *L)
             return 2;
         }
 
-        /* add value */
-        num = value + init;
+
+        if (flags == NGX_HTTP_LUA_SHDICT_INCR) {
+            /* add value */
+            num = value + init;
+
+        } else  { /* decr */
+            num = init - value;
+
+            if (num < 0) {
+                ngx_shmtx_unlock(&ctx->shpool->mutex);
+
+                lua_pushnil(L);
+                lua_pushliteral(L, "cannot initialize decr below zero");
+                return 2;
+            }
+        }
 
         if (rc == NGX_DONE) {
 
@@ -1390,7 +1433,21 @@ ngx_http_lua_shdict_incr(lua_State *L)
     p = sd->data + key.len;
 
     ngx_memcpy(&num, p, sizeof(double));
-    num += value;
+
+    if (flags == NGX_HTTP_LUA_SHDICT_INCR) {
+        num += value;
+
+    } else  { /* decr */
+        num -= value;
+
+        if (num < 0) {
+            ngx_shmtx_unlock(&ctx->shpool->mutex);
+
+            lua_pushnil(L);
+            lua_pushliteral(L, "cannot decr below zero");
+            return 2;
+        }
+    }
 
     ngx_memcpy(p, (double *) &num, sizeof(double));
 
@@ -2633,7 +2690,7 @@ ngx_http_lua_ffi_shdict_get(ngx_shm_zone_t *zone, u_char *key,
 
 
 int
-ngx_http_lua_ffi_shdict_incr(ngx_shm_zone_t *zone, u_char *key,
+ngx_http_lua_ffi_shdict_incr(ngx_shm_zone_t *zone, int op, u_char *key,
     size_t key_len, double *value, char **err, int has_init, double init,
     long init_ttl, int *forcible)
 {
@@ -2676,8 +2733,20 @@ ngx_http_lua_ffi_shdict_incr(ngx_shm_zone_t *zone, u_char *key,
             return NGX_ERROR;
         }
 
-        /* add value */
-        num = *value + init;
+        if (op == NGX_HTTP_LUA_SHDICT_INCR) {
+            /* add value */
+            num = *value + init;
+
+        } else  { /* decr */
+            num = init - *value;
+
+            if (num < 0) {
+                ngx_shmtx_unlock(&ctx->shpool->mutex);
+
+                *err = "cannot initialze decr below zero";
+                return NGX_ERROR;
+            }
+        }
 
         if (rc == NGX_DONE) {
 
@@ -2721,7 +2790,20 @@ ngx_http_lua_ffi_shdict_incr(ngx_shm_zone_t *zone, u_char *key,
     p = sd->data + key_len;
 
     ngx_memcpy(&num, p, sizeof(double));
-    num += *value;
+
+    if (op == NGX_HTTP_LUA_SHDICT_INCR) {
+        num += *value;
+
+    } else { /* decr */
+        num -= *value;
+
+        if (num < 0) {
+            ngx_shmtx_unlock(&ctx->shpool->mutex);
+
+            *err = "cannot decr below zero";
+            return NGX_ERROR;
+        }
+    }
 
     ngx_memcpy(p, (double *) &num, sizeof(double));
 
