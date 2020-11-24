@@ -1545,15 +1545,15 @@ static const char *
 ngx_http_lua_socket_tcp_check_busy(ngx_http_request_t *r,
     ngx_http_lua_socket_tcp_upstream_t *u, unsigned int ops)
 {
-    if (ops & SOCKET_OP_CONNECT && u->conn_waiting) {
+    if ((ops & SOCKET_OP_CONNECT) && u->conn_waiting) {
         return "socket busy connecting";
     }
 
-    if (ops & SOCKET_OP_READ && u->read_waiting) {
+    if ((ops & SOCKET_OP_READ) && u->read_waiting) {
         return "socket busy reading";
     }
 
-    if (ops & SOCKET_OP_WRITE
+    if ((ops & SOCKET_OP_WRITE)
         && (u->write_waiting
             || (u->raw_downstream
                 && (r->connection->buffered & NGX_HTTP_LOWLEVEL_BUFFERED))))
